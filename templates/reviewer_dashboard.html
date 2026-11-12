@@ -5,10 +5,101 @@
   <div>
     <p class="eyebrow">REVIEW DESK</p>
     <h1>复核工作台</h1>
-    <p class="lead">上传纸质卡片扫描图，分配两位录入员；对照原图核对两份独立录入，再核定或改判。</p>
+    <p class="lead">上传纸质卡片扫描图，分配两位录入员；对照原图核对两份独立录入，再核定或改判。核定后按批增量交接给历史观测库。</p>
   </div>
   <a class="button button-primary" href="{{ url_for('export_csv') }}">下载当前核定 CSV</a>
 </div>
+
+<section class="handoff-section" id="handoff">
+  <div class="section-heading">
+    <h2>增量交接 · 历史观测库</h2>
+    <p>从当前已核定的卡中挑出尚未入库、或站号 / 观测日 / 雨量与上次确认入库不同的卡；CSV 供历史库按卡号新增或覆盖。</p>
+  </div>
+
+  {% if pending_batch %}
+    <div class="batch-panel">
+      <div class="batch-panel-head">
+        <span class="batch-no">{{ pending_batch.batch_no }}</span>
+        <span class="status status-conflict">{{ batch_status_labels[pending_batch.status] }}</span>
+        <span class="subtle">{{ pending_batch.created_at|short_dt }} 创建 · {{ pending_batch.card_count }} 张卡</span>
+      </div>
+      <p class="hint">批次内容已冻结：此后改填或服务重启，重新下载仍是同一份 CSV。</p>
+      <div class="batch-actions">
+        <a class="button" href="{{ url_for('download_batch', batch_id=pending_batch.id) }}">下载批次 CSV</a>
+        <form method="post" action="{{ url_for('confirm_batch') }}" class="batch-form">
+          <input type="text" name="batch_no" maxlength="20" placeholder="批号 {{ pending_batch.batch_no }}" autocomplete="off" required>
+          <button type="submit" class="button button-primary">确认整批已入库</button>
+        </form>
+        <form method="post" action="{{ url_for('abandon_batch') }}" class="batch-form">
+          <input type="text" name="batch_no" maxlength="20" placeholder="批号" autocomplete="off" required>
+          <button type="submit" class="button">放弃该批</button>
+        </form>
+      </div>
+      <p class="hint">历史库整批入库后输入批号确认，系统按该批发出的值一次更新这些卡的入库基准；尚未入库可放弃，基准不变。确认与放弃只接受当前待确认批号。</p>
+    </div>
+  {% else %}
+    <div class="batch-panel">
+      {% if delta %}
+        <div class="batch-panel-head">
+          <strong>{{ delta|length }} 张已核定卡待交接</strong>
+          <span class="subtle">暂待复核的卡不在其列，历史库里的记录保持不动</span>
+        </div>
+        <ul class="delta-list">
+          {% for item in delta %}
+            <li>
+              <b>{{ item.card.card_no }}</b>
+              <span>{{ item.values[0] }} / {{ item.values[1] }} / {{ item.values[2] }} mm</span>
+              <em>{{ '首次交接' if item.reason == 'new' else '读数有变化' }}</em>
+            </li>
+          {% endfor %}
+        </ul>
+        <form method="post" action="{{ url_for('create_batch') }}" class="inline-form">
+          <button type="submit" class="button button-primary">创建交接批次（{{ delta|length }} 张卡）</button>
+        </form>
+      {% else %}
+        <p class="batch-empty">当前已核定卡与历史库入库基准一致，没有变化，不建批。</p>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if batch_history %}
+    <div class="table-wrap batch-history-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>批号</th>
+            <th>状态</th>
+            <th>卡数</th>
+            <th>创建</th>
+            <th>办结</th>
+            <th class="align-right">CSV</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for batch in batch_history %}
+            <tr>
+              <td><span class="primary-cell">{{ batch.batch_no }}</span></td>
+              <td>
+                <span class="status {{ 'status-agreed' if batch.status == 'confirmed' else 'status-pending' }}">
+                  {{ batch_status_labels[batch.status] }}
+                </span>
+              </td>
+              <td>{{ batch.card_count }}</td>
+              <td>
+                {{ batch.created_at|short_dt }}
+                <small class="subtle">{{ batch.created_by_name }}</small>
+              </td>
+              <td>{{ batch.closed_at|short_dt }}</td>
+              <td class="align-right">
+                <a class="button button-small" href="{{ url_for('download_batch', batch_id=batch.id) }}">下载</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
 
 <section class="upload-section">
   <div class="section-heading">
@@ -61,6 +152,7 @@
           <th>甲版内容</th>
           <th>乙版内容</th>
           <th>状态</th>
+          <th>历史库</th>
           <th class="align-right">操作</th>
         </tr>
       </thead>
@@ -109,6 +201,9 @@
             <td>
               <span class="status status-{{ row.info.status }}">{{ status_labels[row.info.status] }}</span>
             </td>
+            <td>
+              <span class="archive-state archive-{{ row.archive_state }}">{{ archive_state_labels[row.archive_state] }}</span>
+            </td>
             <td class="align-right">
               <a class="button button-small {% if row.info.status == 'conflict' %}button-attention{% endif %}" href="{{ url_for('reviewer_card', card_id=row.card.id) }}">
                 {{ '对照复核' if row.info.status == 'conflict' else '查看' }}
@@ -129,5 +224,9 @@
 <div class="notice">
   <strong>核定口径</strong>
   <p>两份最新录入完全一致时自动核定；不一致时必须由复核员对照原图选一份。任何一份改填都会立刻撤销旧裁定，旧页面提交的裁定会被拒绝。</p>
+</div>
+<div class="notice">
+  <strong>交接口径</strong>
+  <p>每批只含「尚未入库」或「读数与上次确认入库不同」的已核定卡；暂待复核的卡不撤回历史库记录。同时只允许一个待确认批次，批内容冻结，确认后按批内值更新入库基准，放弃则基准不变。上方「下载当前核定 CSV」始终提供全量核定结果。</p>
 </div>
 {% endblock %}

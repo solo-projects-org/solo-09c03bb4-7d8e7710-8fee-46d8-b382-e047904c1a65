@@ -342,13 +342,92 @@ em { font-style: normal; }
 }
 .field-file { min-width: 0; }
 
+.handoff-section {
+  margin-bottom: 1.5rem;
+  padding: 1.2rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 253, 248, 0.82);
+}
+.batch-panel {
+  display: grid;
+  gap: 0.65rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.batch-panel-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+.batch-no {
+  font-family: var(--serif);
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--green-dark);
+}
+.batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem;
+}
+.batch-form {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+}
+.batch-form input {
+  width: 10.5rem;
+  min-height: 2.5rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0.45rem 0.65rem;
+  color: var(--ink);
+  background: #fffefb;
+  font: 0.9rem var(--sans);
+  outline: none;
+}
+.batch-form input:focus {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(31, 93, 76, 0.13);
+}
+.delta-list {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.delta-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+}
+.delta-list li span { color: var(--muted); }
+.delta-list em { color: var(--amber); font-size: 0.72rem; font-weight: 700; }
+.batch-empty { color: var(--muted); font-size: 0.88rem; }
+.batch-history-wrap { margin-top: 0.9rem; box-shadow: none; }
+.archive-state { font-size: 0.76rem; white-space: nowrap; }
+.archive-new,
+.archive-changed { color: var(--amber); font-weight: 700; }
+.archive-archived { color: var(--green-dark); }
+.archive-held { color: var(--blue); }
+.archive-none { color: var(--muted); }
+
 .filter-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.45rem;
   margin: 0.9rem 0;
-}
-.filter-chip {
+}.filter-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
@@ -663,5 +742,7 @@ em { font-style: normal; }
   .upload-form { grid-template-columns: 1fr; }
   .missing-entries { grid-template-columns: 1fr; }
   .comparison-table { min-width: 620px; }
+  .batch-form { flex-wrap: wrap; }
+  .batch-form input { width: 100%; }
   .page { width: calc(100% - 1.2rem); }
 }

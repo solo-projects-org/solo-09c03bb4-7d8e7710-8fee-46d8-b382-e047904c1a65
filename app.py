@@ -350,6 +350,100 @@ def card_decision_history(db, card_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Incremental handoff to the historical archive
+# ---------------------------------------------------------------------------
+
+BATCH_STATUS_LABELS = {
+    "pending": "待确认",
+    "confirmed": "已确认入库",
+    "abandoned": "已放弃",
+}
+
+ARCHIVE_STATE_LABELS = {
+    "none": "—",
+    "new": "未入库 · 待交接",
+    "changed": "有变化 · 待交接",
+    "archived": "已入库",
+    "held": "已入库 · 复核中",
+}
+
+CSV_HEADER = [
+    "card_no",
+    "station_no",
+    "observation_date",
+    "rainfall_mm",
+    "verification",
+    "verified_at",
+]
+
+
+def build_csv(rows) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(CSV_HEADER)
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+def get_baselines(db) -> dict:
+    return {
+        row["card_id"]: row
+        for row in db.execute("SELECT * FROM archive_baselines").fetchall()
+    }
+
+
+def archive_state(info, baseline) -> str:
+    """How a card currently relates to the historical archive."""
+    if baseline is None:
+        return "new" if info["approved"] else "none"
+    if not info["approved"]:
+        # A card waiting for re-review never withdraws the archived record.
+        return "held"
+    if (
+        baseline["station_no"],
+        baseline["obs_date"],
+        baseline["rainfall_mm"],
+    ) != info["values"]:
+        return "changed"
+    return "archived"
+
+
+def compute_archive_delta(db):
+    """Approved cards not yet archived, or differing from the confirmed baseline."""
+    baselines = get_baselines(db)
+    delta = []
+    cards = db.execute("SELECT * FROM cards ORDER BY id").fetchall()
+    for card in cards:
+        entry_a, entry_b = get_card_entries(db, card)
+        info = resolve_card(entry_a, entry_b, get_active_decision(db, card["id"]))
+        if not info["approved"]:
+            continue
+        baseline = baselines.get(card["id"])
+        if baseline is not None and (
+            baseline["station_no"],
+            baseline["obs_date"],
+            baseline["rainfall_mm"],
+        ) == info["values"]:
+            continue
+        delta.append(
+            {
+                "card": card,
+                "values": info["values"],
+                "method": info["method"],
+                "verified_at": info["verified_at"],
+                "reason": "new" if baseline is None else "changed",
+            }
+        )
+    return delta
+
+
+def get_pending_batch(db):
+    return db.execute(
+        "SELECT * FROM archive_batches WHERE status = 'pending' LIMIT 1"
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -442,7 +536,12 @@ def register_routes(app: Flask) -> None:
 
     @app.context_processor
     def inject_globals():
-        return {"status_labels": STATUS_LABELS, "current_user": g.get("user")}
+        return {
+            "status_labels": STATUS_LABELS,
+            "batch_status_labels": BATCH_STATUS_LABELS,
+            "archive_state_labels": ARCHIVE_STATE_LABELS,
+            "current_user": g.get("user"),
+        }
 
     @app.get("/")
     def index():
@@ -604,6 +703,7 @@ def register_routes(app: Flask) -> None:
         clerks = db.execute(
             "SELECT * FROM users WHERE role = 'clerk' ORDER BY id"
         ).fetchall()
+        baselines = get_baselines(db)
         card_rows = []
         for card in cards:
             entry_a, entry_b = get_card_entries(db, card)
@@ -614,6 +714,7 @@ def register_routes(app: Flask) -> None:
                     "entry_a": entry_a,
                     "entry_b": entry_b,
                     "info": info,
+                    "archive_state": archive_state(info, baselines.get(card["id"])),
                 }
             )
 
@@ -624,6 +725,18 @@ def register_routes(app: Flask) -> None:
         if selected_status in STATUS_LABELS:
             card_rows = [r for r in card_rows if r["info"]["status"] == selected_status]
 
+        pending_batch = get_pending_batch(db)
+        # While a batch awaits confirmation its content is frozen; the delta is
+        # only needed (and only create-able) when no batch is pending.
+        delta = compute_archive_delta(db) if pending_batch is None else None
+        batch_history = db.execute(
+            """SELECT b.*, u.display_name AS created_by_name
+               FROM archive_batches b
+               JOIN users u ON u.id = b.created_by
+               WHERE b.status != 'pending'
+               ORDER BY b.id DESC LIMIT 10"""
+        ).fetchall()
+
         return render_template(
             "reviewer_dashboard.html",
             cards=cards,
@@ -631,6 +744,9 @@ def register_routes(app: Flask) -> None:
             clerks=clerks,
             counts=counts,
             selected_status=selected_status,
+            pending_batch=pending_batch,
+            delta=delta,
+            batch_history=batch_history,
         )
 
     @app.post("/reviewer/upload")
@@ -836,21 +952,11 @@ def register_routes(app: Flask) -> None:
     @app.get("/reviewer/export.csv")
     @role_required("reviewer")
     def export_csv():
+        """Full download: every currently approved card, recomputed live."""
         db = get_db()
-        output = io.StringIO()
-        writer = csv.writer(output, lineterminator="\n")
-        writer.writerow(
-            [
-                "card_no",
-                "station_no",
-                "observation_date",
-                "rainfall_mm",
-                "verification",
-                "verified_at",
-            ]
-        )
         db.execute("BEGIN")
         try:
+            rows = []
             cards = db.execute("SELECT * FROM cards ORDER BY id").fetchall()
             for card in cards:
                 entry_a, entry_b = get_card_entries(db, card)
@@ -859,7 +965,7 @@ def register_routes(app: Flask) -> None:
                 )
                 if not info["approved"]:
                     continue
-                writer.writerow(
+                rows.append(
                     [
                         card["card_no"],
                         info["values"][0],
@@ -873,13 +979,209 @@ def register_routes(app: Flask) -> None:
             db.rollback()
         filename = f"verified-rainfall-{datetime.now(timezone.utc):%Y%m%d}.csv"
         return app.response_class(
-            output.getvalue(),
+            build_csv(rows),
             mimetype="text/csv",
             headers={
                 "Content-Type": "text/csv; charset=utf-8",
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
         )
+
+    @app.post("/reviewer/batches")
+    @role_required("reviewer")
+    def create_batch():
+        """Freeze the current delta (unarchived or changed approved cards)
+        into a single pending handoff batch."""
+        db = get_db()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = get_pending_batch(db)
+            if pending is not None:
+                db.rollback()
+                flash(
+                    f"已存在待确认批次 {pending['batch_no']}，"
+                    "同时只允许一个待确认批次，请先确认或放弃。",
+                    "error",
+                )
+                return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+
+            delta = compute_archive_delta(db)
+            if not delta:
+                db.rollback()
+                flash("已核定卡与入库基准一致，没有变化，不建批。", "warning")
+                return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+
+            now = utc_now()
+            csv_rows = [
+                [
+                    item["card"]["card_no"],
+                    item["values"][0],
+                    item["values"][1],
+                    item["values"][2],
+                    item["method"],
+                    item["verified_at"],
+                ]
+                for item in delta
+            ]
+            # The CSV is frozen at creation: later edits or a service restart
+            # must not change what a re-download of this batch returns.
+            csv_content = build_csv(csv_rows)
+            cur = db.execute(
+                """INSERT INTO archive_batches
+                   (batch_no, status, csv_content, card_count, created_by, created_at)
+                   VALUES (?, 'pending', ?, ?, ?, ?)""",
+                (f"tmp-{secrets.token_hex(8)}", csv_content, len(delta), g.user["id"], now),
+            )
+            batch_id = cur.lastrowid
+            batch_no = f"AH-{batch_id:04d}"
+            db.execute(
+                "UPDATE archive_batches SET batch_no = ? WHERE id = ?",
+                (batch_no, batch_id),
+            )
+            db.executemany(
+                """INSERT INTO archive_batch_items
+                   (batch_id, card_id, card_no, station_no, obs_date,
+                    rainfall_mm, verification, verified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        batch_id,
+                        item["card"]["id"],
+                        item["card"]["card_no"],
+                        item["values"][0],
+                        item["values"][1],
+                        item["values"][2],
+                        item["method"],
+                        item["verified_at"],
+                    )
+                    for item in delta
+                ],
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # Lost a race against another batch creation (unique pending index).
+            db.rollback()
+            flash("另一批次正在创建，请刷新工作台后重试。", "error")
+            return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+        except Exception:
+            if db.in_transaction:
+                db.rollback()
+            raise
+
+        flash(
+            f"已创建交接批次 {batch_no}（{len(delta)} 张卡）。批次内容已冻结，"
+            "历史库整批入库后请按批号确认。",
+            "success",
+        )
+        return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+
+    @app.get("/reviewer/batches/<int:batch_id>/csv")
+    @role_required("reviewer")
+    def download_batch(batch_id: int):
+        """Serve the frozen CSV snapshot of a batch (pending or closed)."""
+        db = get_db()
+        batch = db.execute(
+            "SELECT * FROM archive_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if batch is None:
+            abort(404)
+        filename = f"archive-batch-{batch['batch_no']}.csv"
+        return app.response_class(
+            batch["csv_content"],
+            mimetype="text/csv",
+            headers={
+                "Content-Type": "text/csv; charset=utf-8",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    @app.post("/reviewer/batches/confirm")
+    @role_required("reviewer")
+    def confirm_batch():
+        """The archive ingested the whole batch: apply its frozen values as
+        each card's new archive baseline, in one transaction."""
+        db = get_db()
+        batch_no = (request.form.get("batch_no") or "").strip()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = get_pending_batch(db)
+            if pending is None or pending["batch_no"] != batch_no:
+                db.rollback()
+                flash("确认失败：只接受当前待确认批号。", "error")
+                return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+            items = db.execute(
+                "SELECT * FROM archive_batch_items WHERE batch_id = ? ORDER BY id",
+                (pending["id"],),
+            ).fetchall()
+            now = utc_now()
+            for item in items:
+                db.execute(
+                    """INSERT INTO archive_baselines
+                       (card_id, station_no, obs_date, rainfall_mm,
+                        batch_id, confirmed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(card_id) DO UPDATE SET
+                           station_no = excluded.station_no,
+                           obs_date = excluded.obs_date,
+                           rainfall_mm = excluded.rainfall_mm,
+                           batch_id = excluded.batch_id,
+                           confirmed_at = excluded.confirmed_at""",
+                    (
+                        item["card_id"],
+                        item["station_no"],
+                        item["obs_date"],
+                        item["rainfall_mm"],
+                        pending["id"],
+                        now,
+                    ),
+                )
+            db.execute(
+                """UPDATE archive_batches
+                   SET status = 'confirmed', closed_by = ?, closed_at = ?
+                   WHERE id = ?""",
+                (g.user["id"], now, pending["id"]),
+            )
+            db.commit()
+        except Exception:
+            if db.in_transaction:
+                db.rollback()
+            raise
+
+        flash(
+            f"批次 {batch_no} 已确认入库，{len(items)} 张卡的入库基准"
+            "已按该批发出的值一次更新。",
+            "success",
+        )
+        return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+
+    @app.post("/reviewer/batches/abandon")
+    @role_required("reviewer")
+    def abandon_batch():
+        """Give up a batch that was never ingested. Baselines stay untouched."""
+        db = get_db()
+        batch_no = (request.form.get("batch_no") or "").strip()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = get_pending_batch(db)
+            if pending is None or pending["batch_no"] != batch_no:
+                db.rollback()
+                flash("放弃失败：只接受当前待确认批号。", "error")
+                return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
+            now = utc_now()
+            db.execute(
+                """UPDATE archive_batches
+                   SET status = 'abandoned', closed_by = ?, closed_at = ?
+                   WHERE id = ?""",
+                (g.user["id"], now, pending["id"]),
+            )
+            db.commit()
+        except Exception:
+            if db.in_transaction:
+                db.rollback()
+            raise
+
+        flash(f"批次 {batch_no} 已放弃，未送入历史库，入库基准不变。", "success")
+        return redirect(url_for("reviewer_dashboard", _anchor="handoff"))
 
     @app.get("/cards/<int:card_id>/image")
     @login_required

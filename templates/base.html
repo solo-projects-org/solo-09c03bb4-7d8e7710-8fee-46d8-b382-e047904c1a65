@@ -21,6 +21,7 @@
           <a href="{{ url_for('clerk_dashboard') }}">我的录入</a>
         {% else %}
           <a href="{{ url_for('reviewer_dashboard') }}">复核工作台</a>
+          <a href="{{ url_for('reviewer_dashboard') }}#handoff">增量交接</a>
           <a href="{{ url_for('export_csv') }}">下载核定 CSV</a>
         {% endif %}
         <span class="nav-user">
